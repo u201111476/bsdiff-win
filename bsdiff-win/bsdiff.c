@@ -30,8 +30,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 
 #define MIN(x,y) (((x)<(y)) ? (x) : (y))
+
+typedef unsigned char u_char;
 
 #define errx err
 void err(int exitcode, const char * fmt, ...)
@@ -239,6 +242,8 @@ int main(int argc, char *argv[])
 	if (((I = (long *)malloc((oldsize + 1) * sizeof(long))) == NULL) ||
 		((V = (long *)malloc((oldsize + 1) * sizeof(long))) == NULL)) err(1, NULL);
 
+	//I = (long*)malloc((oldsize + 1) * sizeof(long));
+	//V = (long*)malloc((oldsize + 1) * sizeof(long));
 	qsufsort(I, V, pold, oldsize);
 
 	free(V);
