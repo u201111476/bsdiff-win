@@ -31,10 +31,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include "bsdiff.h"
 
 #define MIN(x,y) (((x)<(y)) ? (x) : (y))
 
 typedef unsigned char u_char;
+
+__declspec(dllexport) void __cdecl print(void)
+{
+	printf("rrr\r\n");
+}
 
 #define errx err
 void err(int exitcode, const char * fmt, ...)
@@ -45,6 +51,16 @@ void err(int exitcode, const char * fmt, ...)
 	va_end(valist);
 	exit(exitcode);
 }
+
+void dllerr(int exitcode, const char* fmt, ...)
+{
+	va_list valist;
+	va_start(valist, fmt);
+	vprintf(fmt, valist);
+	va_end(valist);
+	return;
+}
+
 
 static void split(long *I, long *V, long start, long len, long h)
 {
@@ -203,6 +219,462 @@ static void offtout(long x, u_char *buf)
 	y = y / 256;buf[7] = y % 256;
 
 	if (x < 0) buf[7] |= 0x80;
+}
+
+__declspec(dllexport) int __cdecl bsdiff(const char* oldfile, const char* newfile, const char* patchfile)
+{
+	FILE* fs;
+	u_char* pold, * pnew;
+	long oldsize, newsize;
+	long* I, * V;
+	long scan, pos, len;
+	long lastscan, lastpos, lastoffset;
+	long oldscore, scsc;
+	long s, Sf, lenf, Sb, lenb;
+	long overlap, Ss, lens;
+	long i;
+	long dblen, eblen;
+	u_char* db, * eb;
+	u_char buf[8];
+	u_char header[32];
+	FILE* pf;
+	BZFILE* pfbz2;
+	int bz2err;
+
+	//if (argc != 4) errx(1, "usage: %s oldfile newfile patchfile\n", argv[0]);
+
+	/* Allocate oldsize+1 bytes instead of oldsize bytes to ensure
+		that we never try to malloc(0) and get a NULL pointer */
+	fs = fopen(oldfile, "rb");
+	if (fs == NULL)
+	{
+		//fclose(fs);
+		dllerr(1, "Open failed :%s", oldfile);
+		return 1;
+	}
+	if (fseek(fs, 0, SEEK_END) != 0)
+	{
+		fclose(fs);
+		dllerr(1, "Seek failed :%s", oldfile);
+		return 2;
+	}
+	oldsize = ftell(fs);
+	pold = (u_char*)malloc(oldsize + 1);
+	if (pold == NULL)
+	{
+		dllerr(1, "Malloc failed :%s", oldfile);
+		return 3;
+	}
+	fseek(fs, 0, SEEK_SET);
+	if (fread(pold, 1, oldsize, fs) == -1)
+	{
+		fclose(fs);
+		free(pold);
+		dllerr(1, "Read failed :%s", oldfile);
+		return 4;
+	}
+	if (fclose(fs) == -1)
+	{
+		free(pold);
+		dllerr(1, "Close failed :%s", oldfile);
+		return 5;
+	}
+
+	if (((I = (long*)malloc((oldsize + 1) * sizeof(long))) == NULL) ||
+		((V = (long*)malloc((oldsize + 1) * sizeof(long))) == NULL))
+	{
+		free(pold);
+		dllerr(1, NULL);
+		free(I);
+		free(V);
+		return 6;
+	}
+
+	//I = (long*)malloc((oldsize + 1) * sizeof(long));
+	//V = (long*)malloc((oldsize + 1) * sizeof(long));
+	qsufsort(I, V, pold, oldsize);
+
+	free(V);
+
+	/* Allocate newsize+1 bytes instead of newsize bytes to ensure
+		that we never try to malloc(0) and get a NULL pointer */
+	fs = fopen(newfile, "rb");
+	if (fs == NULL)
+	{
+		free(pold);
+		free(I);
+		dllerr(1, "Open failed :%s", newfile);
+		return 7;
+	}
+	if (fseek(fs, 0, SEEK_END) != 0)
+	{
+		fclose(fs);
+		free(pold);
+		free(I);
+		dllerr(1, "Seek failed :%s", newfile);
+		return 8;
+	}
+	newsize = ftell(fs);
+	pnew = (u_char*)malloc(newsize + 1);
+	if (pnew == NULL)
+	{
+		fclose(fs);
+		free(pold);
+		free(I);
+		dllerr(1, "Malloc failed :%s", newfile);
+		return 9;
+	}
+	fseek(fs, 0, SEEK_SET);
+	if (fread(pnew, 1, newsize, fs) == -1)
+	{
+		fclose(fs);
+		free(pold);
+		free(I);
+		free(pnew);
+		dllerr(1, "Read failed :%s", newfile);
+		return 10;
+	}
+	if (fclose(fs) == -1)
+	{
+		free(pold);
+		free(I);
+		free(pnew);
+		dllerr(1, "Close failed :%s", newfile);
+		return 11;
+	}
+
+	if (((db = (u_char*)malloc(newsize + 1)) == NULL) ||
+		((eb = (u_char*)malloc(newsize + 1)) == NULL))
+	{
+		free(pold);
+		free(I);
+		free(pnew);
+		free(db);
+		free(eb);
+		dllerr(1, NULL);
+		return 12;
+	}
+	dblen = 0;
+	eblen = 0;
+
+	/* Create the patch file */
+	if ((pf = fopen(patchfile, "wb")) == NULL)
+	{
+		free(pold);
+		free(I);
+		free(pnew);
+		free(db);
+		free(eb);
+		dllerr(1, "Open failed %s", patchfile);
+		return 13;
+	}
+
+
+	/* Header is
+		0	8	 "BSDIFF40"
+		8	8	length of bzip2ed ctrl block
+		16	8	length of bzip2ed diff block
+		24	8	length of pnew file */
+		/* File is
+			0	32	Header
+			32	??	Bzip2ed ctrl block
+			??	??	Bzip2ed diff block
+			??	??	Bzip2ed extra block */
+	memcpy(header, "BSDIFF40", 8);
+	offtout(0, header + 8);
+	offtout(0, header + 16);
+	offtout(newsize, header + 24);
+	if (fwrite(header, 32, 1, pf) != 1)
+	{
+		free(db);
+		free(eb);
+		free(I);
+		free(pold);
+		free(pnew);
+		fclose(pf);
+		dllerr(1, "fwrite(%s)", patchfile);
+		return 14;
+	}
+
+	/* Compute the differences, writing ctrl as we go */
+	if ((pfbz2 = BZ2_bzWriteOpen(&bz2err, pf, 9, 0, 0)) == NULL)
+	{
+		free(db);
+		free(eb);
+		free(I);
+		free(pold);
+		free(pnew);
+		fclose(pf);
+		dllerr(1, "BZ2_bzWriteOpen, bz2err = %d", bz2err);
+		return 15;
+	}
+	scan = 0; len = 0;
+	lastscan = 0; lastpos = 0; lastoffset = 0;
+	while (scan < newsize) {
+		oldscore = 0;
+
+		for (scsc = scan += len; scan < newsize; scan++) {
+			len = search(I, pold, oldsize, pnew + scan, newsize - scan,
+				0, oldsize, &pos);
+
+			for (; scsc < scan + len; scsc++)
+				if ((scsc + lastoffset < oldsize) &&
+					(pold[scsc + lastoffset] == pnew[scsc]))
+					oldscore++;
+
+			if (((len == oldscore) && (len != 0)) ||
+				(len > oldscore + 8)) break;
+
+			if ((scan + lastoffset < oldsize) &&
+				(pold[scan + lastoffset] == pnew[scan]))
+				oldscore--;
+		};
+
+		if ((len != oldscore) || (scan == newsize)) {
+			s = 0; Sf = 0; lenf = 0;
+			for (i = 0; (lastscan + i < scan) && (lastpos + i < oldsize);) {
+				if (pold[lastpos + i] == pnew[lastscan + i]) s++;
+				i++;
+				if (s * 2 - i > Sf * 2 - lenf) { Sf = s; lenf = i; };
+			};
+
+			lenb = 0;
+			if (scan < newsize) {
+				s = 0; Sb = 0;
+				for (i = 1; (scan >= lastscan + i) && (pos >= i); i++) {
+					if (pold[pos - i] == pnew[scan - i]) s++;
+					if (s * 2 - i > Sb * 2 - lenb) { Sb = s; lenb = i; };
+				};
+			};
+
+			if (lastscan + lenf > scan - lenb) {
+				overlap = (lastscan + lenf) - (scan - lenb);
+				s = 0; Ss = 0; lens = 0;
+				for (i = 0; i < overlap; i++) {
+					if (pnew[lastscan + lenf - overlap + i] ==
+						pold[lastpos + lenf - overlap + i]) s++;
+					if (pnew[scan - lenb + i] ==
+						pold[pos - lenb + i]) s--;
+					if (s > Ss) { Ss = s; lens = i + 1; };
+				};
+
+				lenf += lens - overlap;
+				lenb -= lens;
+			};
+
+			for (i = 0; i < lenf; i++)
+				db[dblen + i] = pnew[lastscan + i] - pold[lastpos + i];
+			for (i = 0; i < (scan - lenb) - (lastscan + lenf); i++)
+				eb[eblen + i] = pnew[lastscan + lenf + i];
+
+			dblen += lenf;
+			eblen += (scan - lenb) - (lastscan + lenf);
+
+			offtout(lenf, buf);
+			BZ2_bzWrite(&bz2err, pfbz2, buf, 8);
+			if (bz2err != BZ_OK)
+			{
+				free(db);
+				free(eb);
+				free(I);
+				free(pold);
+				free(pnew);
+				fclose(pf);
+				dllerr(1, "BZ2_bzWrite, bz2err = %d", bz2err);
+				return 16;
+			}
+
+			offtout((scan - lenb) - (lastscan + lenf), buf);
+			BZ2_bzWrite(&bz2err, pfbz2, buf, 8);
+			if (bz2err != BZ_OK)
+			{
+				free(db);
+				free(eb);
+				free(I);
+				free(pold);
+				free(pnew);
+				fclose(pf);
+				dllerr(1, "BZ2_bzWrite, bz2err = %d", bz2err);
+				return 17;
+			}
+
+			offtout((pos - lenb) - (lastpos + lenf), buf);
+			BZ2_bzWrite(&bz2err, pfbz2, buf, 8);
+			if (bz2err != BZ_OK)
+			{
+				free(db);
+				free(eb);
+				free(I);
+				free(pold);
+				free(pnew);
+				fclose(pf);
+				dllerr(1, "BZ2_bzWrite, bz2err = %d", bz2err);
+				return 18;
+			}
+
+			lastscan = scan - lenb;
+			lastpos = pos - lenb;
+			lastoffset = pos - scan;
+		};
+	};
+	BZ2_bzWriteClose(&bz2err, pfbz2, 0, NULL, NULL);
+	if (bz2err != BZ_OK)
+	{
+		free(db);
+		free(eb);
+		free(I);
+		free(pold);
+		free(pnew);
+		fclose(pf);
+		dllerr(1, "BZ2_bzWriteClose, bz2err = %d", bz2err);
+		return 19;
+	}
+
+	/* Compute size of compressed ctrl data */
+	if ((len = ftell(pf)) == -1)
+	{
+		free(db);
+		free(eb);
+		free(I);
+		free(pold);
+		free(pnew);
+		fclose(pf);
+		dllerr(1, "ftello");
+		return 20;
+	}
+	offtout(len - 32, header + 8);
+
+	/* Write compressed diff data */
+	if ((pfbz2 = BZ2_bzWriteOpen(&bz2err, pf, 9, 0, 0)) == NULL)
+	{
+		free(db);
+		free(eb);
+		free(I);
+		free(pold);
+		free(pnew);
+		fclose(pf);
+		dllerr(1, "BZ2_bzWriteOpen, bz2err = %d", bz2err);
+		return 21;
+	}
+	BZ2_bzWrite(&bz2err, pfbz2, db, dblen);
+	if (bz2err != BZ_OK)
+	{
+		free(db);
+		free(eb);
+		free(I);
+		free(pold);
+		free(pnew);
+		fclose(pf);
+		dllerr(1, "BZ2_bzWrite, bz2err = %d", bz2err);
+		return 22;
+	}
+	BZ2_bzWriteClose(&bz2err, pfbz2, 0, NULL, NULL);
+	if (bz2err != BZ_OK)
+	{
+		free(db);
+		free(eb);
+		free(I);
+		free(pold);
+		free(pnew);
+		fclose(pf);
+		dllerr(1, "BZ2_bzWriteClose, bz2err = %d", bz2err);
+		return 23;
+	}
+
+	/* Compute size of compressed diff data */
+	if ((newsize = ftell(pf)) == -1)
+	{
+		free(db);
+		free(eb);
+		free(I);
+		free(pold);
+		free(pnew);
+		fclose(pf);
+		dllerr(1, "ftello");
+		return 24;
+	}
+	offtout(newsize - len, header + 16);
+
+	/* Write compressed extra data */
+	if ((pfbz2 = BZ2_bzWriteOpen(&bz2err, pf, 9, 0, 0)) == NULL)
+	{
+		free(db);
+		free(eb);
+		free(I);
+		free(pold);
+		free(pnew);
+		fclose(pf);
+		dllerr(1, "BZ2_bzWriteOpen, bz2err = %d", bz2err);
+		return 25;
+	}
+	BZ2_bzWrite(&bz2err, pfbz2, eb, eblen);
+	if (bz2err != BZ_OK)
+	{
+		free(db);
+		free(eb);
+		free(I);
+		free(pold);
+		free(pnew);
+		fclose(pf);
+		dllerr(1, "BZ2_bzWrite, bz2err = %d", bz2err);
+		return 26;
+	}
+
+	BZ2_bzWriteClose(&bz2err, pfbz2, 0, NULL, NULL);
+	if (bz2err != BZ_OK)
+	{
+		free(db);
+		free(eb);
+		free(I);
+		free(pold);
+		free(pnew);
+		fclose(pf);
+		dllerr(1, "BZ2_bzWriteClose, bz2err = %d", bz2err);
+		return 27;
+	}
+
+	/* Seek to the beginning, write the header, and close the file */
+	if (fseek(pf, 0, SEEK_SET))
+	{
+		free(db);
+		free(eb);
+		free(I);
+		free(pold);
+		free(pnew);
+		fclose(pf);
+		dllerr(1, "fseeko");
+		return 28;
+	}
+	if (fwrite(header, 32, 1, pf) != 1)
+	{
+		free(db);
+		free(eb);
+		free(I);
+		free(pold);
+		free(pnew);
+		fclose(pf);
+		dllerr(1, "fwrite(%s)", patchfile);
+		return 29;
+	}
+	if (fclose(pf))
+	{
+		free(db);
+		free(eb);
+		free(I);
+		free(pold);
+		free(pnew);
+		fclose(pf);
+		dllerr(1, "fclose");
+		return 30;
+	}
+
+	/* Free the memory we used */
+	free(db);
+	free(eb);
+	free(I);
+	free(pold);
+	free(pnew);
+	return 0;
 }
 
 int main(int argc, char *argv[])

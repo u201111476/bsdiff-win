@@ -47,5 +47,8 @@
     <ClInclude Include="..\bzip2-1.0.6\bzlib_private.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="bsdiff.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>
